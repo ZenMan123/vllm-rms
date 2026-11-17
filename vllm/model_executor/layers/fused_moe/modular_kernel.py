@@ -668,7 +668,9 @@ class FusedMoEExperts(ABC):
             return f"kernel does not support {reason}"
 
         executed_key = cls.executed_activation_key(weight_key, activation_key)
-        if not cls._supports_current_device():
+        if moe_config.mask_pruned_routes and not cls.supports_pruned_routes():
+            return False, _make_reason("pruned expert assignments (ID -1)")
+        elif not cls._supports_current_device():
             return False, _make_reason(f"current device {current_platform.device_name}")
         elif not (moe_config.is_act_and_mul or cls._supports_no_act_and_mul()):
             return False, _make_reason("no act_and_mul MLP layer")
@@ -716,6 +718,15 @@ class FusedMoEExperts(ABC):
         ):
             return False, reason
         return True, None
+
+    @staticmethod
+    def supports_pruned_routes() -> bool:
+        """Skip individual ID -1 assignments in dispatch and reduction.
+
+        A zero gate alone is insufficient: omitted workspace rows can contain
+        stale values, including NaNs. Kernels must opt in to this contract.
+        """
+        return False
 
     @staticmethod
     @abstractmethod

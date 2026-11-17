@@ -392,6 +392,7 @@ def fused_moe_kernel(
     USE_TMA_B: tl.constexpr = False,
     USE_TMA_A: tl.constexpr = False,
     C_IS_SORTED: tl.constexpr = False,
+    SKIP_INVALID_ROWS: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -443,6 +444,8 @@ def fused_moe_kernel(
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    if SKIP_INVALID_ROWS and tl.load(expert_ids_ptr + pid_m) < 0:
         return
     if not naive_block_assignment:
         offs_token_id = pid_m * BLOCK_SIZE_M + offs
@@ -898,7 +901,13 @@ def invoke_fused_moe_triton_kernel(
     per_out_ch_quant: bool | None = None,
     A_is_sorted: bool = False,
     C_is_sorted: bool = False,
+    skip_invalid_rows: bool = False,
 ):
+    """Launch expert GEMM, optionally leaving invalid rows untouched.
+
+    With `skip_invalid_rows`, every downstream consumer must mask invalid
+    assignments rather than relying on their workspace rows containing zeros.
+    """
     assert topk_weights is not None or not mul_routed_weight
     if topk_weights is not None and not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous")
@@ -1077,6 +1086,7 @@ def invoke_fused_moe_triton_kernel(
         USE_TMA_B=use_tma_b,
         USE_TMA_A=use_tma_a,
         C_IS_SORTED=C_is_sorted,
+        SKIP_INVALID_ROWS=skip_invalid_rows,
         **config,
     )
 

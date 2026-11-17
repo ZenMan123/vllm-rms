@@ -743,6 +743,7 @@ def _swiglu_limit_pad_aware_kernel(
     HAS_LIMIT: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ROUND_SILU: tl.constexpr = False,
 ):
     # Persistent over rows: each CTA owns one column tile and processes a
     # strided set of token assignments.
@@ -777,7 +778,11 @@ def _swiglu_limit_pad_aware_kernel(
                 up = tl.maximum(up, -swiglu_limit)
                 up = tl.minimum(up, swiglu_limit)
 
-            silu_gate = gate / (1.0 + tl.exp(-gate))
+            if ROUND_SILU:
+                silu_gate = tl.div_rn(gate, 1.0 + tl.extra.cuda.libdevice.exp(-gate))
+                silu_gate = silu_gate.to(output_ptr.dtype.element_ty).to(tl.float32)
+            else:
+                silu_gate = gate / (1.0 + tl.exp(-gate))
             result = silu_gate * up
             tl.store(
                 output_ptr + row.to(tl.int64) * hidden_size + column_tile,
@@ -792,6 +797,8 @@ def _swiglu_limit_pad_aware(
     topk_ids: torch.Tensor,
     swiglu_limit: float,
     expert_map: torch.Tensor | None = None,
+    *,
+    round_silu: bool = False,
 ) -> None:
     num_tokens, gate_up_size = input.shape
     hidden_size = gate_up_size // 2
@@ -812,7 +819,9 @@ def _swiglu_limit_pad_aware(
         HAS_LIMIT=swiglu_limit > 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
+        ROUND_SILU=round_silu,
         num_warps=4,
+        enable_fp_fusion=not round_silu,
     )
 
 
@@ -822,12 +831,16 @@ def swiglu_limit_func(
     swiglu_limit: float = 0.0,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    *,
+    round_silu: bool = False,
 ) -> None:
     # The pad-aware Triton kernel skips unrouted token slots (topk_ids == -1)
     # and, when expert_map is given, slots routed to non-local experts, so it
     # requires topk_ids. Fall back to the torch implementation otherwise.
     if topk_ids is not None:
-        _swiglu_limit_pad_aware(output, input, topk_ids, swiglu_limit, expert_map)
+        _swiglu_limit_pad_aware(
+            output, input, topk_ids, swiglu_limit, expert_map, round_silu=round_silu
+        )
     elif current_platform.is_cuda():
         torch.ops._C.silu_and_mul_with_clamp(output, input, swiglu_limit, 1.0, 0.0)
     else:

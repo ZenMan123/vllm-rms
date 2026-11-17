@@ -108,6 +108,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
     @staticmethod
+    def supports_pruned_routes() -> bool:
+        return True
+
+    @staticmethod
     def is_supported_config(
         cls: type[mk.FusedMoEExperts],
         moe_config: FusedMoEConfig,
@@ -258,6 +262,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         **kwargs,
     ) -> None:
         activation_config = self.activation_config
+        if self.moe_config.mask_pruned_routes and activation == MoEActivation.SILU:
+            topk_ids = kwargs.get("topk_ids")
+            assert topk_ids is not None
+            swiglu_limit_func(
+                output,
+                input,
+                activation_config.clamp_limit or 0.0,
+                topk_ids,
+                kwargs.get("expert_map"),
+                round_silu=activation_config.clamp_limit is None,
+            )
+            return
         if (
             activation == MoEActivation.SILU
             and activation_config.clamp_limit is not None
@@ -549,6 +565,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 block_shape=self.block_shape,
                 B_bias=self.w1_bias,
                 C_is_sorted=use_sorted_a,
+                skip_invalid_rows=self.moe_config.mask_pruned_routes,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -677,7 +694,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
         else:
             self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+                activation,
+                intermediate_cache2,
+                intermediate_cache1.view(-1, N),
+                topk_ids=topk_ids,
+                expert_map=expert_map,
             )
 
             # Row-local schemes quantize per row, but a per-tensor dynamic
@@ -737,6 +758,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 block_shape=self.block_shape,
                 B_bias=self.w2_bias,
                 A_is_sorted=use_sorted_a,
+                skip_invalid_rows=self.moe_config.mask_pruned_routes,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -805,9 +827,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         topk_ids: torch.Tensor | None = None,
         expert_map: torch.Tensor | None = None,
     ) -> None:
-        if expert_map is not None:
-            # Skip the slots whose expert is not on this rank: the rows the
-            # alignment dropped, or the zeros the `-1` blocks wrote.
+        if self.moe_config.mask_pruned_routes:
+            assert topk_ids is not None
+        if expert_map is not None or self.moe_config.mask_pruned_routes:
+            # EP and opt-in route pruning can leave workspace rows unwritten.
+            # Preserve the original reduction for all other callers.
             ops.moe_sum(input, output, topk_ids, expert_map)
         else:
             ops.moe_sum(input, output)

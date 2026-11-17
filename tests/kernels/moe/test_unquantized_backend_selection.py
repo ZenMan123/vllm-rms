@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,29 @@ skipif_not_cuda_rocm = pytest.mark.skipif(
     not (current_platform.is_cuda() or current_platform.is_rocm()),
     reason="Only supported on CUDA/ROCm platforms.",
 )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="RMS requires CUDA")
+@pytest.mark.parametrize(
+    "unsupported", ["batched_triton", "flashinfer_cutlass", "flashinfer_trtllm"]
+)
+def test_pruning_auto_selects_capable_kernel_and_rejects_unsupported_backend(
+    unsupported,
+):
+    config = replace(
+        make_dummy_moe_config(
+            num_experts=40, experts_per_token=8, hidden_dim=256, intermediate_size=512
+        ),
+        mask_pruned_routes=True,
+        require_decomposed_backend=True,
+        routing_method=RoutingMethodType.Custom,
+    )
+    _, kernel = select_unquantized_moe_backend(config)
+    assert kernel is not None and kernel.supports_pruned_routes()
+    assert kernel.__name__ == "TritonExperts"
+    assert not kernel.is_monolithic()
+    with pytest.raises(ValueError, match="pruned expert assignments"):
+        select_unquantized_moe_backend(replace(config, moe_backend=unsupported))
 
 
 @pytest.mark.parametrize(

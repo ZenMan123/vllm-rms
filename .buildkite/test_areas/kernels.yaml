@@ -644,8 +644,11 @@ steps:
   source_file_dependencies:
   - csrc/quantization/w8a8/cutlass/moe/
   - csrc/moe/
+  - examples/offline_inference/moe/export_rms_tables.py
   - tests/kernels/moe
+  - tests/model_executor/layers/test_rms_moe.py
   - vllm/model_executor/layers/fused_moe/
+  - vllm/model_executor/layers/rms_moe.py
   - vllm/model_executor/model_loader/reload/
   - vllm/models/muse_spark/common/
   - vllm/models/muse_spark/nvidia/
@@ -655,6 +658,7 @@ steps:
   commands:
     - pytest -v -s kernels/moe --ignore=kernels/moe/test_modular_oai_triton_moe.py
     - pytest -v -s kernels/moe/test_modular_oai_triton_moe.py
+    - pytest -v -s model_executor/layers/test_rms_moe.py
   mirror:
     amd:
       label: ":amd: (MI300) MoE Kernels"

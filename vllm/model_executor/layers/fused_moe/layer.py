@@ -147,6 +147,7 @@ def FusedMoEFactory(
     moe_config_cls: type[FusedMoEConfig] | None = None,
     routed_experts_args: dict[str, Any] | None = None,
     skip_padding: bool = False,
+    mask_pruned_routes: bool = False,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -231,12 +232,18 @@ def FusedMoEFactory(
         skip_padding: With ROCm AITER fused MoE, let grouped routing mask
             padding rows under DeepEP v2; otherwise it follows
             VLLM_MOE_SKIP_PADDING.
+        mask_pruned_routes: Exclude pruned ID -1 assignments from the expert
+            computation. Select only kernels supporting pruned routes.
 
     Returns:
         MoERunner: Configured MoE execution pipeline ready for forward passes
 
     """
     vllm_config = get_current_vllm_config()
+    if mask_pruned_routes and (
+        quant_config is not None or vllm_config.lora_config is not None
+    ):
+        raise ValueError("mask_pruned_routes requires unquantized experts without LoRA")
 
     layer_name = prefix
 
@@ -387,8 +394,11 @@ def FusedMoEFactory(
         routing_method=router.kernel_routing_method_type,
         has_hash_routing=hash_indices_table is not None,
         require_decomposed_backend=(
-            expert_substitution is not None or not router.supports_monolithic_kernels
+            expert_substitution is not None
+            or not router.supports_monolithic_kernels
+            or mask_pruned_routes
         ),
+        mask_pruned_routes=mask_pruned_routes,
         swiglu_limit=swiglu_limit,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,

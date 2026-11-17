@@ -1369,6 +1369,9 @@ class FusedMoEConfig:
     has_hash_routing: bool = False
     # Routes are adjusted between routing and expert execution.
     require_decomposed_backend: bool = False
+    # Opt-in for routers that prune individual assignments with expert ID -1.
+    # Select kernels that omit these assignments from dispatch and reduction.
+    mask_pruned_routes: bool = field(default=False, kw_only=True)
     shared_expert_prefix: str | None = None
 
     # When True, the MoE skips its final cross-rank all-reduce (and the separate

@@ -1,5 +1,9 @@
 # Features
 
+## MoE inference
+
+- [RMS expert pruning for Granite](rms_expert_pruning.md)
+
 ## KV Cache Offloading
 
 - [UMBPStoreConnector](umbp_store_connector_usage.md)

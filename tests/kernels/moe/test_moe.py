@@ -7,7 +7,7 @@ Run `pytest tests/kernels/test_moe.py`.
 
 import functools
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NotRequired, TypedDict
 
 import pytest
@@ -88,6 +88,166 @@ DEVICE_TYPE = current_platform.device_type
 requires_deep_ep_v2 = pytest.mark.skipif(
     not has_deep_ep_v2(), reason="Requires DeepEP v2 (ElasticBuffer)"
 )
+
+
+def test_triton_sum_ignores_pruned_nan_slots_without_expert_parallelism():
+    """Alignment leaves dropped routes unwritten, including stale NaNs."""
+    config = replace(make_dummy_moe_config(), mask_pruned_routes=True)
+    experts = TritonExperts(config, FUSED_MOE_UNQUANTIZED_CONFIG)
+    values = torch.full((3, 8, 128), float("nan"), device=DEVICE_TYPE)
+    ids = torch.full((3, 8), -1, dtype=torch.int32, device=DEVICE_TYPE)
+    ids[0, 3] = 0
+    ids[1, 0] = 1
+    ids[1, 7] = 2
+    values[0, 3] = 2
+    values[1, 0] = 3
+    values[1, 7] = 4
+    output = torch.empty((3, 128), device=DEVICE_TYPE)
+    experts.moe_sum(values, output, ids)
+    expected = torch.tensor([2, 7, 0], device=DEVICE_TYPE).float()[:, None]
+    torch.testing.assert_close(output, expected.expand_as(output), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_rows", [8, 72, 1032])
+def test_triton_pruned_activation_leaves_dropped_rows_unwritten(dtype, num_rows):
+    """Dropped rows must not be read or overwritten, including graph replay."""
+    torch.manual_seed(731)
+    config = replace(make_dummy_moe_config(), mask_pruned_routes=True)
+    experts = TritonExperts(config, FUSED_MOE_UNQUANTIZED_CONFIG)
+    values = torch.randn((num_rows, 1024), device=DEVICE_TYPE, dtype=dtype)
+    ids = torch.arange(num_rows, device=DEVICE_TYPE, dtype=torch.int32) % 40
+    ids[::3] = -1
+    values[ids < 0] = float("nan")
+    reference = torch.empty((num_rows, 512), device=DEVICE_TYPE, dtype=dtype)
+    torch.ops._C.silu_and_mul(reference, values)
+    output = torch.full_like(reference, 123)
+    experts.activation(MoEActivation.SILU, output, values, topk_ids=ids)
+    torch.testing.assert_close(output[ids >= 0], reference[ids >= 0], atol=0, rtol=0)
+    assert torch.all(output[ids < 0] == 123)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        experts.activation(MoEActivation.SILU, output, values, topk_ids=ids)
+    ids.fill_(-1)
+    values.fill_(float("nan"))
+    output.fill_(321)
+    graph.replay()
+    assert torch.all(output == 321)
+
+
+@pytest.mark.parametrize("skip_invalid", [False, True])
+def test_triton_gemm_invalid_route_write_contract(skip_invalid):
+    """Skip mode preserves the workspace; default mode still writes zeros."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        invoke_fused_moe_triton_kernel,
+    )
+
+    x = torch.full((1, 128), float("nan"), device=DEVICE_TYPE, dtype=torch.bfloat16)
+    weights = torch.full((1, 128, 128), float("nan"), device=DEVICE_TYPE, dtype=x.dtype)
+    output = torch.full((1, 1, 128), 123, device=DEVICE_TYPE, dtype=x.dtype)
+    ids = torch.tensor([-1], device=DEVICE_TYPE, dtype=torch.int32)
+    padded = torch.tensor([16], device=DEVICE_TYPE, dtype=torch.int32)
+    kwargs = {"skip_invalid_rows": True} if skip_invalid else {}
+    invoke_fused_moe_triton_kernel(
+        x,
+        weights,
+        output,
+        None,
+        None,
+        None,
+        None,
+        ids,
+        padded,
+        False,
+        1,
+        {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 4,
+        },
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        False,
+        False,
+        **kwargs,
+    )
+    assert torch.all(output == (123 if skip_invalid else 0))
+
+
+@pytest.mark.parametrize("use_expert_map", [False, True])
+@pytest.mark.parametrize("provide_ids", [False, True])
+def test_triton_default_reduction_preserves_upstream_path(use_expert_map, provide_ids):
+    """Without the pruning opt-in, match the original no-EP and EP reductions."""
+    from vllm import _custom_ops as ops
+
+    experts = TritonExperts(make_dummy_moe_config(), FUSED_MOE_UNQUANTIZED_CONFIG)
+    values = torch.arange(3 * 8 * 128, device=DEVICE_TYPE).float().view(3, 8, 128)
+    ids = torch.arange(8, device=DEVICE_TYPE, dtype=torch.int32).expand(3, -1)
+    ids = ids.contiguous()
+    ids[:, -1] = -1
+    expert_map = None
+    if use_expert_map:
+        expert_map = torch.arange(8, device=DEVICE_TYPE, dtype=torch.int32)
+        expert_map[0] = -1
+    if not provide_ids:
+        ids = None
+    expected = torch.empty((3, 128), device=DEVICE_TYPE)
+    actual = torch.empty_like(expected)
+    if expert_map is not None:
+        ops.moe_sum(values, expected, ids, expert_map)
+    else:
+        ops.moe_sum(values, expected)
+    experts.moe_sum(values, actual, ids, expert_map)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 9, 17, 129])
+def test_triton_experts_execute_pruned_routes(workspace_init, num_tokens):
+    """Both tiny decode and aligned prefill must exclude every ID -1 route."""
+    torch.manual_seed(42)
+    m, e, k, n, top_k = num_tokens, 40, 128, 64, 8
+    a = torch.randn(m, k, device=DEVICE_TYPE, dtype=torch.bfloat16) / 10
+    w1 = torch.randn(e, 2 * n, k, device=DEVICE_TYPE, dtype=a.dtype) / 10
+    w2 = torch.randn(e, k, n, device=DEVICE_TYPE, dtype=a.dtype) / 10
+    logits = torch.randn(m, e, device=DEVICE_TYPE)
+    weights, ids = logits.softmax(-1).topk(top_k)
+    weights /= weights.sum(-1, keepdim=True)
+    ids = ids.int()
+    mask = torch.arange(top_k, device=DEVICE_TYPE)[None, :] >= (
+        1 + torch.arange(m, device=DEVICE_TYPE)[:, None] % top_k
+    )
+    pruned_ids = ids.masked_fill(mask, -1)
+    pruned_weights = weights.masked_fill(mask, 0)
+    config = make_dummy_moe_config(
+        num_experts=e,
+        experts_per_token=top_k,
+        hidden_dim=k,
+        intermediate_size=n,
+        in_dtype=a.dtype,
+        max_num_tokens=m,
+    )
+    config = replace(config, mask_pruned_routes=True)
+    kernel = modular_triton_fused_moe(config, FUSED_MOE_UNQUANTIZED_CONFIG)
+    with set_current_vllm_config(VllmConfig()):
+        expected = torch_experts(a, w1, w2, pruned_weights, ids)
+        for route_ids, route_weights in [(ids, weights), (pruned_ids, pruned_weights)]:
+            actual = kernel.apply(
+                hidden_states=a,
+                w1=w1,
+                w2=w2,
+                topk_weights=route_weights,
+                topk_ids=route_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=e,
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
 def test_triton_moe_launcher_passes_scalar_scale_as_pointer(monkeypatch) -> None:
