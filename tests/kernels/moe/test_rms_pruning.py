@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.router.rms_pruning import (
+    fused_topk_rms_routes,
     prune_rms_routes,
     softmax_prune_rms_routes,
 )
@@ -70,17 +71,33 @@ def test_fused_softmax_rms_preserves_native_gates(tokens, top_k, budget, dtype):
     assert torch.equal(actual_weights, weights.masked_fill(~keep, 0))
 
 
-@pytest.mark.parametrize("tokens", [1, 17, 0])
-@pytest.mark.parametrize("top_k", [1, 3, 8, 31])
+@pytest.mark.parametrize("tokens", [1, 17, 513, 0])
+@pytest.mark.parametrize(
+    "num_experts, top_k",
+    [
+        (16, 1),
+        (16, 3),
+        (16, 8),
+        (40, 1),
+        (40, 3),
+        (40, 8),
+        (40, 31),
+        (64, 1),
+        (64, 8),
+        (64, 31),
+    ],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("ties", [False, True])
-def test_unsorted_rms_topk_preserves_sorted_route_ranks(tokens, top_k, dtype, ties):
+def test_unsorted_rms_topk_preserves_sorted_route_ranks(
+    tokens, num_experts, top_k, dtype, ties
+):
     """Fusing the final top-k sort must preserve rank-indexed calibration."""
     torch.manual_seed(731)
-    logits = torch.randn(tokens, 40, device="cuda", dtype=dtype)
+    logits = torch.randn(tokens, num_experts, device="cuda", dtype=dtype)
     if ties:
         logits = logits.round()
-    scale = torch.rand(40, top_k, 4, device="cuda") + 0.1
+    scale = torch.rand(num_experts, top_k, 4, device="cuda") + 0.1
     eligible = torch.rand_like(scale) > 0.2
     edges = torch.tensor([0.04, 0.08, 0.16], device="cuda")
     edges = edges.expand(top_k, -1).contiguous()
@@ -93,6 +110,10 @@ def test_unsorted_rms_topk_preserves_sorted_route_ranks(tokens, top_k, dtype, ti
         ids, values, scale, eligible, edges, 0.1, None, dtype, sort_inputs=True
     )
     for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, atol=0, rtol=0)
+
+    fused = fused_topk_rms_routes(logits, scale, eligible, edges, 0.1, None, dtype)
+    for result, reference in zip(fused, expected):
         torch.testing.assert_close(result, reference, atol=0, rtol=0)
 
 

@@ -156,6 +156,25 @@ class RMSMoERouter(nn.Module):
             raise ValueError("Router dimensions do not match RMS calibration")
         if not renormalize:
             raise ValueError("RMS routing requires the original top-k softmax")
+        if (
+            gating_output.is_cuda
+            and gating_output.is_contiguous()
+            and self.num_experts <= 64
+            and topk <= 32
+        ):
+            from vllm.model_executor.layers.fused_moe.router.rms_pruning import (
+                fused_topk_rms_routes,
+            )
+
+            return fused_topk_rms_routes(
+                gating_output,
+                self.scale,
+                self.eligible,
+                self.edges,
+                self.budget,
+                self.weight_floor,
+                hidden_states.dtype,
+            )
         fuse_topk_sort = gating_output.is_cuda and topk <= 32
         logits, ids = torch.topk(gating_output, topk, dim=-1, sorted=not fuse_topk_sort)
         if fuse_topk_sort:

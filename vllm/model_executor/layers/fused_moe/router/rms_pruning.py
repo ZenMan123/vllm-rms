@@ -49,13 +49,44 @@ def _prune_rms_routes(
     APPLY_SOFTMAX: tl.constexpr,
     BLOCK: tl.constexpr,
     SORT_INPUTS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr = 0,
 ):
     token = tl.program_id(0)
     rank = tl.arange(0, BLOCK)
     valid = rank < TOP_K
     offsets = token * TOP_K + rank
-    ids = tl.load(ids_ptr + offsets, valid, other=0)
-    weights = tl.load(weights_ptr + offsets, valid, other=0)
+    if NUM_EXPERTS:
+        # Reproduce CUDA radix top-k's gather order: values above the kth
+        # key first, then equal keys in input order. Preserve signed zero
+        # in radix keys; the subsequent native bitonic sort uses float ties.
+        expert_rank = tl.arange(0, 64)
+        logits = tl.load(
+            weights_ptr + token * NUM_EXPERTS + expert_rank,
+            expert_rank < NUM_EXPERTS,
+            other=-float("inf"),
+        ).to(tl.float32)
+        bits = logits.to(tl.uint32, bitcast=True)
+        keys = tl.where(bits & 0x80000000 != 0, ~bits, bits ^ 0x80000000)
+        keys = tl.where(logits != logits, 0xFFFFFFFF, keys)
+        keys = tl.where(expert_rank < NUM_EXPERTS, keys, 0)
+        sorted_keys = tl.sort(keys, descending=True)
+        threshold = tl.sum(tl.where(expert_rank == TOP_K - 1, sorted_keys, 0), 0)
+        above = (keys > threshold) & (expert_rank < NUM_EXPERTS)
+        equal = (keys == threshold) & (expert_rank < NUM_EXPERTS)
+        num_above = tl.sum(above.to(tl.int32), 0)
+        above_pos = tl.cumsum(above.to(tl.int32), 0) - 1
+        equal_pos = num_above + tl.cumsum(equal.to(tl.int32), 0) - 1
+        pos = tl.where(above, above_pos, equal_pos)
+        selected = above | (equal & (pos < TOP_K))
+        packed = tl.where(selected, pos * 64 + expert_rank, 0x7FFFFFFF)
+        packed = tl.sort(packed, descending=False)
+        ids = tl.gather(packed, rank, 0) % 64
+        ids = tl.where(valid, ids, 0)
+        weights = tl.gather(logits, ids, 0)
+        weights = tl.where(valid, weights, 0.0)
+    else:
+        ids = tl.load(ids_ptr + offsets, valid, other=0)
+        weights = tl.load(weights_ptr + offsets, valid, other=0)
     if SORT_INPUTS:
         ids, weights = _sort_small_topk(ids, weights, rank, valid)
     if APPLY_SOFTMAX:
@@ -197,3 +228,55 @@ def softmax_prune_rms_routes(
         True,
         sort_inputs,
     )
+
+
+def fused_topk_rms_routes(
+    logits: torch.Tensor,
+    scale: torch.Tensor,
+    eligible: torch.Tensor,
+    edges: torch.Tensor,
+    budget: float,
+    weight_floor: float | None,
+    gate_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse native small-row top-k, gate rounding and calibrated pruning."""
+    num_tokens, num_experts = logits.shape
+    top_k = scale.shape[1]
+    if (
+        not logits.is_contiguous()
+        or not 1 <= top_k <= min(32, num_experts)
+        or num_experts > 64
+    ):
+        raise ValueError(
+            "Fused RMS top-k requires contiguous rows, E <= 64 and K <= 32"
+        )
+    out_ids = torch.empty((num_tokens, top_k), device=logits.device, dtype=torch.int32)
+    out_weights = torch.empty(
+        (num_tokens, top_k), device=logits.device, dtype=torch.float32
+    )
+    if num_tokens:
+        _prune_rms_routes[(num_tokens,)](
+            None,
+            logits,
+            scale,
+            eligible,
+            edges,
+            out_ids,
+            out_weights,
+            TOP_K=top_k,
+            BINS=scale.shape[-1],
+            BUDGET=budget,
+            WEIGHT_FLOOR=weight_floor,
+            ROUND_DTYPE={
+                torch.bfloat16: tl.bfloat16,
+                torch.float16: tl.float16,
+                torch.float32: tl.float32,
+            }[gate_dtype],
+            APPLY_SOFTMAX=True,
+            BLOCK=32,
+            SORT_INPUTS=True,
+            NUM_EXPERTS=num_experts,
+            num_warps=1,
+            enable_fp_fusion=False,
+        )
+    return out_weights, out_ids

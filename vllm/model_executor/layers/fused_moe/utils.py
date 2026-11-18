@@ -805,8 +805,9 @@ def _swiglu_limit_pad_aware(
     if num_tokens == 0:
         return
 
-    BLOCK_SIZE = 1024
-    grid = (min(num_tokens, 256), triton.cdiv(hidden_size, BLOCK_SIZE))
+    BLOCK_SIZE = min(1024, triton.next_power_of_2(hidden_size)) if round_silu else 1024
+    rows = num_tokens if round_silu else min(num_tokens, 256)
+    grid = (rows, triton.cdiv(hidden_size, BLOCK_SIZE))
     _swiglu_limit_pad_aware_kernel[grid](
         input,
         output,

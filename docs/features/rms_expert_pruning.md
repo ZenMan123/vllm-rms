@@ -114,11 +114,11 @@ one expert. Finite protected scores participate in the denominator. A zero
 budget or zero score sum retains every original assignment. The remaining
 gates keep their original values.
 
-On CUDA, for up to 32 selected experts, native top-k selects without its separate
-final sort. A single Triton launch restores the CUDA small-sort rank order,
-including equal logits, then performs FP32 softmax, native gate rounding, table
-lookup, stable score ordering and the budget decision. This removes one launch
-without changing the rank-indexed table lookup. The softmax uses libdevice
+On CUDA, contiguous rows with at most 64 experts and top-k at most 32 fuse
+selection, native rank restoration, softmax and pruning in one Triton launch.
+The selection preserves CUDA radix top-k's input order, including signed zero,
+and the final small-sort tie behavior required by rank-indexed calibration.
+Larger or non-contiguous rows retain native top-k followed by fused pruning. The softmax uses libdevice
 exponential and rounded
 division to preserve the native gates. Stable ordering packs each non-negative
 score's FP32 bits and its original rank into an integer key. Larger top-k uses
@@ -134,7 +134,11 @@ In the general Triton path, RMS enables `skip_invalid_rows` on both expert
 GEMMs. An invalid assignment returns before input/weight loads and does not
 zero-fill its workspace row. SiLU also checks the assignment before reading
 gate/up values or writing an output. This reuses the existing pad-aware
-activation kernel with the native intermediate SiLU rounding. These options
+activation kernel with the native intermediate SiLU rounding. In this RMS-only
+rounding mode the column tile fits the expert width (up to 1024 elements), and
+each assignment receives its own CTA rather than reusing a grid capped at 256
+rows. Both expert projections continue to use the existing grouped GEMMs;
+no separate expert-computation kernels are introduced. These options
 are confined to `mask_pruned_routes`; the default expert path retains its
 original zero-fill and activation behavior. Grouped GEMMs can still execute
 padded tile rows, and a retained assignment to the same expert still needs
