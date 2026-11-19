@@ -339,10 +339,7 @@ class GraniteMoeModel(nn.Module, EagleModelMixin):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: GraniteMoeDecoderLayer(
-                vllm_config,
-                prefix=prefix,
-            ),
+            lambda prefix: GraniteMoeDecoderLayer(vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
 

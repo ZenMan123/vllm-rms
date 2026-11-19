@@ -277,12 +277,18 @@ class BaseRouter(FusedMoERouter):
         self._validate_eplb_state()
 
         # Step 2: Compute routing (delegated to subclass)
-        topk_weights, topk_ids = self._compute_routing(
-            hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
-        )
-
-        if self.rms_pruner is not None:
-            topk_weights, topk_ids = self.rms_pruner(topk_weights, topk_ids)
+        if self.rms_pruner is None:
+            topk_weights, topk_ids = self._compute_routing(
+                hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
+            )
+        else:
+            topk_weights, topk_ids = self.rms_pruner.route(
+                self._compute_routing,
+                hidden_states,
+                router_logits,
+                topk_indices_dtype,
+                input_ids=input_ids,
+            )
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

@@ -6,7 +6,13 @@ configuration field `rms_expert_pruning`. Models using the decomposed FusedMoE e
 assignments returned by their native router.
 
 The implementation uses unquantized experts on CUDA. Granite retains its fused
-top-k implementation. Gemma 4 MoE uses its native router followed by RMS. Backend selection uses the normal vLLM oracle, restricted to kernels
+top-k implementation. With a positive budget, Gemma 4 MoE applies RMS in
+its native routing kernel after the learned per-expert scale. The standard
+CUDA softmax router can fuse RMS when vLLM uses its warp top-k algorithm on
+packed rows. Both kernels take the expert count and top-k from the model and
+its calibration table. The standard softmax router uses post-routing RMS for
+large sorting workloads, batches above 512 token rows, and layouts handled
+by vLLM's native block reduction. Backend selection uses the normal vLLM oracle, restricted to kernels
 that declare support for pruning individual expert assignments. You can omit
 `--moe-backend` to use `auto`, or select Triton explicitly:
 

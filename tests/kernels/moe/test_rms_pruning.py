@@ -188,3 +188,110 @@ def test_native_route_pruning_preserves_signed_gates_and_padding(budget):
     torch.testing.assert_close(
         kept_weights, weights.masked_fill(expected_ids < 0, 0), atol=0, rtol=0
     )
+
+
+@pytest.mark.parametrize(
+    "router,experts,k",
+    [
+        ("softmax", 1, 1),
+        ("softmax", 8, 2),
+        ("softmax", 64, 6),
+        ("softmax", 128, 3),
+        ("softmax", 192, 7),
+        ("softmax", 256, 8),
+        ("softmax", 320, 10),
+        ("softmax", 384, 9),
+        ("softmax", 448, 16),
+        ("softmax", 512, 33),
+        ("softmax", 576, 4),
+        ("gemma", 8, 2),
+        ("gemma", 40, 6),
+        ("gemma", 128, 8),
+        ("gemma", 160, 11),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_fused_native_rms_matches_two_launches(router, experts, k, dtype):
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.router.rms_pruning import (
+        warp_softmax_rms_routes,
+    )
+    from vllm.model_executor.layers.rms_moe import RMSMoETables, RMSRoutePruner
+    from vllm.model_executor.models.gemma4 import gemma4_fused_routing_kernel_triton
+
+    torch.manual_seed(51)
+    n = 257
+    scale = torch.rand(1, experts, k, 4)
+    edges = torch.tensor([0.07, 0.13, 0.2]).expand(1, k, 3).contiguous()
+    pruner = RMSRoutePruner(RMSMoETables(scale, scale > 0.05, edges), 0, 0.1, "cuda")
+    logits = torch.randn(n, experts, dtype=dtype, device="cuda")
+    logits[0] = 0
+    logits[1, 0] = float("nan")
+    logits[2, 0] = float("inf")
+    logits[3] = -float("inf")
+    padding = torch.arange(n, device="cuda") % 7 == 4
+    if router == "softmax":
+        ids = torch.empty(n, k, device="cuda", dtype=torch.int32)
+        w = torch.empty_like(ids, dtype=torch.float32)
+        for renormalize in (False, True):
+            ops.topk_softmax(
+                w, ids, torch.empty_like(ids), logits, renormalize, is_padding=padding
+            )
+            fused = warp_softmax_rms_routes(
+                logits, pruner, padding, renormalize=renormalize
+            )
+            for actual, expected in zip(fused, pruner(w, ids)):
+                torch.testing.assert_close(
+                    actual, expected, atol=0, rtol=0, equal_nan=True
+                )
+        return
+    expert_scale = torch.randn(experts, device="cuda", dtype=dtype)
+    w, ids = gemma4_fused_routing_kernel_triton(
+        logits, k, expert_scale, is_padding=padding
+    )
+    fused = gemma4_fused_routing_kernel_triton(
+        logits, k, expert_scale, is_padding=padding, rms_pruner=pruner
+    )
+    for actual, expected in zip(fused, pruner(w, ids)):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
+
+
+@pytest.mark.parametrize(
+    "tokens,experts,pad_columns",
+    [
+        (513, 256, 0),
+        (512, 512, 0),
+        (128, 576, 0),
+        (2, 60, 0),
+        (1, 1024, 0),
+        (2, 256, 1),
+        (1, 256, 1),
+    ],
+)
+def test_softmax_fallback_preserves_rms(tokens, experts, pad_columns):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        FusedTopKRouter,
+    )
+    from vllm.model_executor.layers.rms_moe import (
+        RMSMoETables,
+        RMSRoutePruner,
+        try_fused_rms_softmax,
+    )
+
+    k = 4
+    logits = torch.zeros(tokens, experts + pad_columns, device="cuda")[:, :experts]
+    router = FusedTopKRouter(k, experts)
+    scale = torch.ones(1, experts, k, 1)
+    scale[:, :, -1] = 0.01
+    pruner = RMSRoutePruner(
+        RMSMoETables(scale, scale.bool(), torch.empty(1, k, 0)), 0, 0.1, "cuda"
+    )
+    assert try_fused_rms_softmax(logits, pruner) is None
+    w, ids = router.select_experts(logits, logits, torch.int32)
+    pruner.fused_routing = try_fused_rms_softmax
+    router.rms_pruner = pruner
+    fw, fi = router.select_experts(logits, logits, torch.int32)
+    assert torch.equal(
+        fi, torch.cat([ids[:, :-1], torch.full_like(ids[:, -1:], -1)], 1)
+    )
+    assert torch.equal(fw, torch.cat([w[:, :-1], torch.zeros_like(w[:, -1:])], 1))

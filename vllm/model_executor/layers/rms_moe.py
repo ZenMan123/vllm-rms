@@ -4,6 +4,7 @@
 
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -141,8 +142,76 @@ class RMSLayerTable(nn.Module):
             )
 
 
+def try_fused_rms_softmax(
+    logits: torch.Tensor,
+    pruner: "RMSRoutePruner",
+    *,
+    renormalize: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        get_moe_padding_mask,
+    )
+    from vllm.model_executor.layers.fused_moe.router.rms_pruning import (
+        warp_softmax_rms_routes,
+    )
+
+    num_tokens, num_experts = logits.shape
+    # Match the warp specializations of vLLM's topkGatingKernelLauncher.
+    # Other widths use a CUB block reduction with different FP32 rounding.
+    power_of_two = num_experts & (num_experts - 1) == 0
+    warp_layout = 0 < num_experts <= 576 and (power_of_two or num_experts % 64 == 0)
+    # A100 timings favour the native router for large sorts. Estimate the
+    # workload using the padded Triton row width and its number of stages.
+    stages = (num_experts - 1).bit_length()
+    sort_work = num_tokens * (1 << stages) * stages
+    # The native warp kernel wins on large prefills. Row-padded logits use
+    # a different native reduction and must take the post-routing path.
+    if (
+        num_tokens > 512
+        or sort_work > (1 << 20)
+        or not warp_layout
+        or logits.stride(0) != num_experts
+        or not logits.is_contiguous()
+        or logits.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+    ):
+        return None
+    return warp_softmax_rms_routes(
+        logits, pruner, get_moe_padding_mask(num_tokens), renormalize=renormalize
+    )
+
+
 class RMSRoutePruner(RMSLayerTable):
     """Prune native slots using final gate magnitudes; preserve signed weights."""
+
+    fused_routing: (
+        Callable[
+            [torch.Tensor, "RMSRoutePruner"], tuple[torch.Tensor, torch.Tensor] | None
+        ]
+        | None
+    ) = None
+
+    def route(
+        self,
+        native: Callable,
+        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        indices_dtype: torch.dtype | None,
+        *,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.budget > 0
+            and self.fused_routing is not None
+            and logits.shape[-1] == self.num_experts
+        ):
+            fused = self.fused_routing(logits, self)
+            if fused is not None:
+                weights, ids = fused
+                if indices_dtype is not None:
+                    ids = ids.to(indices_dtype)
+                return weights, ids
+        weights, ids = native(hidden_states, logits, indices_dtype, input_ids=input_ids)
+        return self(weights, ids)
 
     def forward(
         self, weights: torch.Tensor, ids: torch.Tensor

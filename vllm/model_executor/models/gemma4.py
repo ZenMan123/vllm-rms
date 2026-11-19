@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.fused_moe.router.base_router import (
     get_moe_padding_mask,
 )
+from vllm.model_executor.layers.fused_moe.router.rms_pruning import _store_pruned_routes
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -143,6 +144,12 @@ def _gemma4_routing_kernel(
     K: tl.constexpr,
     BLOCK_E: tl.constexpr,
     HAS_PADDING: tl.constexpr,
+    scale_ptr=None,
+    eligible_ptr=None,
+    edges_ptr=None,
+    BINS: tl.constexpr = 0,
+    BUDGET: tl.constexpr = 0.0,
+    WEIGHT_FLOOR: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
     offs_e = tl.arange(0, BLOCK_E)
@@ -201,6 +208,27 @@ def _gemma4_routing_kernel(
         all_ids = tl.where(is_pad, -1, all_ids)
         all_weights = tl.where(is_pad, 0.0, all_weights)
 
+    if BINS:
+        rank = tl.arange(0, triton.next_power_of_2(K))
+        _store_pruned_routes(
+            pid,
+            tl.gather(all_ids, rank, 0),
+            tl.gather(all_weights, rank, 0),
+            scale_ptr,
+            eligible_ptr,
+            edges_ptr,
+            topk_ids_ptr,
+            topk_weights_ptr,
+            K,
+            BINS,
+            BUDGET,
+            WEIGHT_FLOOR,
+            triton.next_power_of_2(K),
+            True,
+            E,
+        )
+        return
+
     # Write results with TWO masked stores — replaces K × 2 serial scalar stores
     base_off = pid * K + offs_e
     tl.store(topk_ids_ptr + base_off, all_ids, mask=top_mask)
@@ -214,6 +242,7 @@ def gemma4_fused_routing_kernel_triton(
     num_warps: int = 1,
     *,
     is_padding: torch.Tensor | None = None,
+    rms_pruner=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     gating_output = gating_output.contiguous()
     per_expert_scale = per_expert_scale.contiguous()
@@ -221,6 +250,16 @@ def gemma4_fused_routing_kernel_triton(
     weights = torch.empty(T, topk, dtype=torch.float32, device=gating_output.device)
     ids = torch.empty(T, topk, dtype=torch.int32, device=gating_output.device)
     BLOCK_E = triton.next_power_of_2(E)
+    rms_args: tuple[torch.Tensor | int | float | None, ...] = ()
+    if rms_pruner is not None:
+        rms_args = (
+            rms_pruner.scale,
+            rms_pruner.eligible,
+            rms_pruner.edges,
+            rms_pruner.scale.shape[-1],
+            rms_pruner.budget,
+            rms_pruner.weight_floor,
+        )
     _gemma4_routing_kernel[(T,)](
         gating_output,
         per_expert_scale,
@@ -231,6 +270,7 @@ def gemma4_fused_routing_kernel_triton(
         topk,
         BLOCK_E,
         is_padding is not None,
+        *rms_args,
         num_warps=num_warps,
     )
     return weights, ids
@@ -377,6 +417,15 @@ class Gemma4Router(nn.Module):
             bias=False,
             out_dtype=torch.float32,
             prefix=f"{prefix}.proj",
+        )
+
+    def rms_routing_function(self, logits, pruner):
+        return gemma4_fused_routing_kernel_triton(
+            logits,
+            pruner.top_k,
+            self.per_expert_scale,
+            is_padding=get_moe_padding_mask(logits.shape[0]),
+            rms_pruner=pruner,
         )
 
     def routing_function(
@@ -712,6 +761,7 @@ class Gemma4DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.experts",
                 custom_routing_function=self.router.routing_function,
+                rms_routing_function=self.router.rms_routing_function,
                 activation="gelu_tanh",
             )
             self.post_feedforward_layernorm_1 = RMSNorm(

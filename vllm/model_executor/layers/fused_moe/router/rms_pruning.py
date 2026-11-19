@@ -101,6 +101,45 @@ def _prune_rms_routes(
         # Preserve the calibrated native gate rounding without two standalone
         # dtype-conversion kernels and their intermediate buffers.
         weights = weights.to(ROUND_DTYPE).to(tl.float32)
+    _store_pruned_routes(
+        token,
+        ids,
+        weights,
+        scale_ptr,
+        eligible_ptr,
+        edges_ptr,
+        out_ids_ptr,
+        out_weights_ptr,
+        TOP_K,
+        BINS,
+        BUDGET,
+        WEIGHT_FLOOR,
+        BLOCK,
+        NATIVE_ROUTES,
+        TABLE_EXPERTS,
+    )
+
+
+@triton.jit
+def _store_pruned_routes(
+    token,
+    ids,
+    weights,
+    scale_ptr,
+    eligible_ptr,
+    edges_ptr,
+    out_ids_ptr,
+    out_weights_ptr,
+    TOP_K: tl.constexpr,
+    BINS: tl.constexpr,
+    BUDGET: tl.constexpr,
+    WEIGHT_FLOOR: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NATIVE_ROUTES: tl.constexpr,
+    TABLE_EXPERTS: tl.constexpr,
+):
+    rank = tl.arange(0, BLOCK)
+    valid = rank < TOP_K
     gate = weights
     routed = valid
     if NATIVE_ROUTES:
@@ -308,3 +347,121 @@ def fused_topk_rms_routes(
             enable_fp_fusion=False,
         )
     return out_weights, out_ids
+
+
+@triton.jit
+def _warp_softmax_rms_kernel(
+    logits_ptr,
+    padding_ptr,
+    scale_ptr,
+    eligible_ptr,
+    edges_ptr,
+    ids_ptr,
+    weights_ptr,
+    EXPERTS: tl.constexpr,
+    TOP_K: tl.constexpr,
+    VECTOR: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+    BINS: tl.constexpr,
+    BUDGET: tl.constexpr,
+    WEIGHT_FLOOR: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
+):
+    token = tl.program_id(0)
+    BLOCK_E: tl.constexpr = triton.next_power_of_2(EXPERTS)
+    BLOCK_K: tl.constexpr = triton.next_power_of_2(TOP_K)
+    LANES: tl.constexpr = min(32, EXPERTS // VECTOR)
+    expert = tl.arange(0, BLOCK_E)
+    lane = tl.arange(0, LANES)
+    logits = tl.load(
+        logits_ptr + token * EXPERTS + expert, expert < EXPERTS, other=-float("inf")
+    ).to(tl.float32)
+    numerator = tl.extra.cuda.libdevice.exp(logits - tl.max(logits, 0))
+    # Match the native vector loads, sequential lane sums and XOR warp reduction.
+    lane_sum = tl.full((LANES,), 0.0, tl.float32)
+    for n in tl.static_range(EXPERTS // LANES):
+        column = (n // VECTOR) * (LANES * VECTOR) + lane * VECTOR + n % VECTOR
+        lane_sum += tl.gather(numerator, column, 0)
+    for stage in tl.static_range(5):
+        distance = 16 >> stage
+        if distance < LANES:
+            lane_sum += tl.gather(lane_sum, lane ^ distance, 0)
+    denom = tl.sum(tl.where(lane == 0, lane_sum, 0.0), 0)
+    probs = numerator * tl.div_rn(1.0, denom)
+    # vLLM clamps invalid softmax outputs before its top-k selection.
+    probs = tl.where((probs == probs) & (probs < float("inf")), probs, 0.0)
+    # The native argmax resolves ties in favour of the lowest expert ID.
+    keys = (probs.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | (
+        BLOCK_E - 1 - expert
+    ).to(tl.uint64)
+    keys = tl.where(expert < EXPERTS, keys, 0)
+    ordered = tl.topk(keys, BLOCK_K)
+    ids = BLOCK_E - 1 - (ordered & 0xFFFFFFFF).to(tl.int32)
+    chosen = (ordered >> 32).to(tl.uint32).to(tl.float32, bitcast=True)
+    weights = chosen
+    if RENORMALIZE:
+        selected_sum = 0.0
+        for k in tl.range(TOP_K, loop_unroll_factor=min(TOP_K, 32)):
+            selected_sum += tl.sum(tl.gather(chosen, tl.full((1,), k, tl.int32), 0), 0)
+        weights = chosen * tl.div_rn(
+            1.0, tl.where(selected_sum > 0.0, selected_sum, 1.0)
+        )
+    if HAS_PADDING:
+        ids = tl.where(tl.load(padding_ptr + token), -1, ids)
+    _store_pruned_routes(
+        token,
+        ids,
+        weights,
+        scale_ptr,
+        eligible_ptr,
+        edges_ptr,
+        ids_ptr,
+        weights_ptr,
+        TOP_K,
+        BINS,
+        BUDGET,
+        WEIGHT_FLOOR,
+        BLOCK_K,
+        True,
+        EXPERTS,
+    )
+
+
+def warp_softmax_rms_routes(
+    logits: torch.Tensor,
+    table,
+    padding: torch.Tensor | None = None,
+    *,
+    renormalize: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse the native CUDA warp softmax and calibrated pruning on packed rows."""
+    num_tokens, num_experts = logits.shape
+    top_k = table.scale.shape[1]
+    # Match topkGatingLauncherHelper's load width, in input elements.
+    power_of_two = num_experts & (num_experts - 1) == 0
+    vector = min(num_experts, 16 // logits.element_size()) if power_of_two else 2
+    ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device=logits.device)
+    weights = torch.empty_like(ids, dtype=torch.float32)
+    if num_tokens:
+        _warp_softmax_rms_kernel[(num_tokens,)](
+            logits,
+            padding,
+            table.scale,
+            table.eligible,
+            table.edges,
+            ids,
+            weights,
+            num_experts,
+            top_k,
+            vector,
+            renormalize,
+            table.scale.shape[-1],
+            table.budget,
+            table.weight_floor,
+            padding is not None,
+            # Wider sorts benefit from four warps. Keep a single warp for
+            # multi-warp-sized top-k to match the reference RMS reduction order.
+            num_warps=4 if num_experts > 128 and top_k <= 32 else 1,
+            enable_fp_fusion=False,
+        )
+    return weights, ids

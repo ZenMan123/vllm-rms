@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 import torch
@@ -149,6 +150,7 @@ def FusedMoEFactory(
     skip_padding: bool = False,
     mask_pruned_routes: bool = False,
     rms_fused_topk: bool = False,
+    rms_routing_function: Callable | None = None,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -233,6 +235,8 @@ def FusedMoEFactory(
         skip_padding: With ROCm AITER fused MoE, let grouped routing mask
             padding rows under DeepEP v2; otherwise it follows
             VLLM_MOE_SKIP_PADDING.
+        rms_routing_function: Optional implementation of native routing and RMS
+            in one launch. Return None to use native routing followed by RMS.
         rms_fused_topk: Use Granite fused top-k softmax when RMS is enabled.
         mask_pruned_routes: Exclude pruned ID -1 assignments from the expert
             computation. Select only kernels supporting pruned routes.
@@ -403,9 +407,19 @@ def FusedMoEFactory(
 
     if rms_pruner is not None:
         from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+            FusedTopKRouter,
+        )
+        from vllm.model_executor.layers.rms_moe import try_fused_rms_softmax
 
         if not isinstance(router, BaseRouter):
             raise ValueError("RMS post-routing requires a vLLM BaseRouter")
+        if rms_routing_function is not None:
+            rms_pruner.fused_routing = rms_routing_function
+        elif type(router) is FusedTopKRouter and router.scoring_func == "softmax":
+            rms_pruner.fused_routing = partial(
+                try_fused_rms_softmax, renormalize=router.renormalize
+            )
         router.rms_pruner = rms_pruner
 
     if params_dtype is None:
