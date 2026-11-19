@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from vllm.config.load import LoadConfig
     from vllm.config.parallel import ParallelConfig
     from vllm.model_executor.layers.quantization import QuantizationMethods
+    from vllm.model_executor.layers.rms_moe import RMSMoETables
     from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsProcessor
 else:
     PreTrainedConfig = Any
@@ -1752,6 +1753,25 @@ class ModelConfig:
         return getattr_iter(
             self.hf_text_config, names, default_factory=self.get_hidden_size
         )
+
+    @cached_property
+    def rms_expert_pruning(self) -> tuple["RMSMoETables", float] | None:
+        """Frozen CPU tables shared by this model's routed layers."""
+        spec = getattr(self.hf_config, "rms_expert_pruning", None)
+        if spec is None:
+            spec = getattr(self.hf_text_config, "rms_expert_pruning", None)
+        # Multimodal wrappers initialize their language model with a copy of
+        # the text config. The engine-level overrides survive that substitution.
+        if spec is None and isinstance(self.hf_overrides, dict):
+            spec = self.hf_overrides.get("rms_expert_pruning")
+        if spec is None:
+            return None
+        from vllm.model_executor.layers.rms_moe import RMSMoETables, validate_rms_budget
+
+        if not isinstance(spec, dict) or set(spec) != {"tables", "budget"}:
+            raise ValueError("rms_expert_pruning requires tables and budget")
+        budget = validate_rms_budget(spec["budget"])
+        return RMSMoETables.load(spec["tables"]), budget
 
     @property
     def is_deepseek_mla(self) -> bool:

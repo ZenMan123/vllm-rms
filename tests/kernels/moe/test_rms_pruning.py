@@ -159,3 +159,32 @@ def test_rms_replay_changes_masks_and_respects_exact_boundaries():
         expected = rms_keep_mask(*args)
         assert torch.equal(actual_ids, ids.masked_fill(~expected, -1).int())
         assert torch.equal(actual_weights, weights.masked_fill(~expected, 0))
+
+
+@pytest.mark.parametrize("budget", [0.5, 1.0])
+def test_native_route_pruning_preserves_signed_gates_and_padding(budget):
+    weights = torch.tensor(
+        [[-0.8, 0.15, -0.05], [0.0, -0.4, 0.0], [0.0, 0.0, 0.0]],
+        device="cuda",
+        dtype=torch.float16,
+    )
+    ids = torch.tensor(
+        [[2, 0, 1], [-1, 2, -1], [-1, -1, -1]], device="cuda", dtype=torch.int64
+    )
+    scale = torch.ones(3, 3, 1, device="cuda")
+    kept_weights, kept_ids = prune_rms_routes(
+        ids,
+        weights,
+        scale,
+        torch.ones_like(scale, dtype=torch.bool),
+        torch.empty(3, 0, device="cuda"),
+        budget,
+        None,
+        native_routes=True,
+    )
+    expected_ids = ids.clone()
+    expected_ids[0, 1:] = -1
+    torch.testing.assert_close(kept_ids, expected_ids)
+    torch.testing.assert_close(
+        kept_weights, weights.masked_fill(expected_ids < 0, 0), atol=0, rtol=0
+    )

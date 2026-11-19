@@ -167,6 +167,7 @@ class BaseRouter(FusedMoERouter):
         super().__init__(eplb_state=eplb_state)
         self.top_k = top_k
         self.global_num_experts = global_num_experts
+        self.rms_pruner: torch.nn.Module | None = None
         self.capture_fn: Callable[[torch.Tensor], None] | None = None
 
     def set_capture_fn(self, capture_fn: Callable[[torch.Tensor], None] | None) -> None:
@@ -279,6 +280,9 @@ class BaseRouter(FusedMoERouter):
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
+
+        if self.rms_pruner is not None:
+            topk_weights, topk_ids = self.rms_pruner(topk_weights, topk_ids)
 
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:

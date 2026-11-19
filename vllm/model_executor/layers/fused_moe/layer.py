@@ -148,6 +148,7 @@ def FusedMoEFactory(
     routed_experts_args: dict[str, Any] | None = None,
     skip_padding: bool = False,
     mask_pruned_routes: bool = False,
+    rms_fused_topk: bool = False,
 ) -> MoERunner:
     """Factory function for creating MoE execution pipeline.
 
@@ -232,6 +233,7 @@ def FusedMoEFactory(
         skip_padding: With ROCm AITER fused MoE, let grouped routing mask
             padding rows under DeepEP v2; otherwise it follows
             VLLM_MOE_SKIP_PADDING.
+        rms_fused_topk: Use Granite fused top-k softmax when RMS is enabled.
         mask_pruned_routes: Exclude pruned ID -1 assignments from the expert
             computation. Select only kernels supporting pruned routes.
 
@@ -240,6 +242,46 @@ def FusedMoEFactory(
 
     """
     vllm_config = get_current_vllm_config()
+    rms = getattr(vllm_config.model_config, "rms_expert_pruning", None)
+    rms_pruner = None
+    if rms is not None:
+        import vllm.envs as envs
+        from vllm.model_executor.layers.fused_moe.expert_substitution import (
+            get_expert_substitution_spec,
+        )
+        from vllm.model_executor.layers.rms_moe import RMSMoERouter, RMSRoutePruner
+        from vllm.model_executor.models.utils import extract_layer_index
+        from vllm.platforms import current_platform
+
+        parallel = vllm_config.parallel_config
+        if (
+            not current_platform.is_cuda()
+            or parallel.enable_expert_parallel
+            or parallel.enable_eplb
+            or enable_eplb
+            or envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
+            or get_expert_substitution_spec(vllm_config.model_config) is not None
+            or zero_expert_type
+            or (fuse_shared_experts and n_shared_experts)
+            or num_redundant_experts
+            or apply_router_weight_on_input
+        ):
+            raise ValueError("RMS requires CUDA and ordinary logical routed expert IDs")
+        tables, budget = rms
+        expected = (
+            vllm_config.model_config.hf_text_config.num_hidden_layers,
+            num_experts,
+            top_k,
+        )
+        if tables.scale.shape[:3] != expected:
+            raise ValueError(f"RMS table dimensions must match {expected} for {prefix}")
+        layer = extract_layer_index(prefix)
+        device = vllm_config.device_config.device_type
+        if rms_fused_topk:
+            custom_routing_function = RMSMoERouter(tables, layer, budget, device)
+        else:
+            rms_pruner = RMSRoutePruner(tables, layer, budget, device)
+        mask_pruned_routes = True
     if mask_pruned_routes and (
         quant_config is not None or vllm_config.lora_config is not None
     ):
@@ -358,6 +400,13 @@ def FusedMoEFactory(
             bias_vl=bias_vl,
             image_sentinel_lo=image_sentinel_lo,
         )
+
+    if rms_pruner is not None:
+        from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+        if not isinstance(router, BaseRouter):
+            raise ValueError("RMS post-routing requires a vLLM BaseRouter")
+        router.rms_pruner = rms_pruner
 
     if params_dtype is None:
         params_dtype = torch.get_default_dtype()

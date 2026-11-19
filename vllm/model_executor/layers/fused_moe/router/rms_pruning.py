@@ -50,6 +50,8 @@ def _prune_rms_routes(
     BLOCK: tl.constexpr,
     SORT_INPUTS: tl.constexpr,
     NUM_EXPERTS: tl.constexpr = 0,
+    NATIVE_ROUTES: tl.constexpr = False,
+    TABLE_EXPERTS: tl.constexpr = 0,
 ):
     token = tl.program_id(0)
     rank = tl.arange(0, BLOCK)
@@ -99,18 +101,25 @@ def _prune_rms_routes(
         # Preserve the calibrated native gate rounding without two standalone
         # dtype-conversion kernels and their intermediate buffers.
         weights = weights.to(ROUND_DTYPE).to(tl.float32)
+    gate = weights
+    routed = valid
+    if NATIVE_ROUTES:
+        gate = tl.abs(weights.to(tl.float32))
+        routed = valid & (ids >= 0) & (ids < TABLE_EXPERTS)
+        ids = tl.where(routed, ids, -1)
+        weights = tl.where(routed, weights, 0.0)
     bins = tl.full((BLOCK,), 0, tl.int32)
     for boundary in tl.static_range(BINS - 1):
         edge = tl.load(edges_ptr + rank * (BINS - 1) + boundary, valid, other=0)
-        bins += (weights > edge).to(tl.int32)
+        bins += (gate > edge).to(tl.int32)
     cell = (ids * TOP_K + rank) * BINS + bins
-    scale = tl.load(scale_ptr + cell, valid, other=0)
-    eligible = tl.load(eligible_ptr + cell, valid, other=0)
-    scores = weights * scale
+    scale = tl.load(scale_ptr + cell, routed, other=0)
+    eligible = tl.load(eligible_ptr + cell, routed, other=0)
+    scores = gate * scale
     finite = (scores == scores) & (tl.abs(scores) < float("inf"))
-    reliable = valid & eligible & finite
+    reliable = routed & eligible & finite
     if WEIGHT_FLOOR is not None:
-        reliable &= weights > WEIGHT_FLOOR
+        reliable &= gate > WEIGHT_FLOOR
     scores = tl.where(finite & valid, tl.maximum(scores, 0.0), 0.0)
     denominator = tl.sum(scores, 0)
     ranked = tl.where(reliable, scores, float("inf"))
@@ -124,11 +133,14 @@ def _prune_rms_routes(
     original_rank = (ordered_keys % BLOCK).to(tl.int32)
     ordered = (ordered_keys // BLOCK).to(tl.uint32).to(tl.float32, bitcast=True)
     costs = tl.div_rn(tl.cumsum(ordered, 0), tl.maximum(denominator, 1e-30))
+    count = TOP_K
+    if NATIVE_ROUTES:
+        count = tl.sum(routed.to(tl.int32), 0)
     drop = (
         (BUDGET > 0)
         & tl.gather(reliable, original_rank, 0)
         & (denominator > 0)
-        & (rank < TOP_K - 1)
+        & (rank < count - 1)
         & (costs <= BUDGET)
     )
     offsets = token * TOP_K + original_rank
@@ -150,14 +162,17 @@ def _launch_rms_pruning(
     round_dtype: torch.dtype | None,
     apply_softmax: bool,
     sort_inputs: bool = False,
+    native_routes: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if budget == 0 and not apply_softmax:
         if round_dtype is not None:
             weights = weights.to(round_dtype).float()
-        return weights, ids.int()
+        return weights, ids if native_routes else ids.int()
     num_tokens, top_k = ids.shape
-    out_ids = torch.empty_like(ids, dtype=torch.int32)
-    out_weights = torch.empty_like(weights, dtype=torch.float32)
+    out_ids = torch.empty_like(ids, dtype=ids.dtype if native_routes else torch.int32)
+    out_weights = torch.empty_like(
+        weights, dtype=weights.dtype if native_routes else torch.float32
+    )
     if num_tokens:
         _prune_rms_routes[(num_tokens,)](
             ids,
@@ -179,6 +194,8 @@ def _launch_rms_pruning(
             APPLY_SOFTMAX=apply_softmax,
             BLOCK=32 if sort_inputs else triton.next_power_of_2(top_k),
             SORT_INPUTS=sort_inputs,
+            NATIVE_ROUTES=native_routes,
+            TABLE_EXPERTS=scale.shape[0],
             num_warps=1,
             enable_fp_fusion=False,
         )
@@ -194,10 +211,21 @@ def prune_rms_routes(
     budget: float,
     weight_floor: float | None,
     round_dtype: torch.dtype | None = None,
+    *,
+    native_routes: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prune precomputed gates, optionally rounding to the native gate dtype."""
     return _launch_rms_pruning(
-        ids, weights, scale, eligible, edges, budget, weight_floor, round_dtype, False
+        ids,
+        weights,
+        scale,
+        eligible,
+        edges,
+        budget,
+        weight_floor,
+        round_dtype,
+        False,
+        native_routes=native_routes,
     )
 
 

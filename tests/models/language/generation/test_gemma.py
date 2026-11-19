@@ -233,3 +233,141 @@ def test_gemma4_per_layer_embeddings_pipeline_parallel(
         name_0="pp1",
         name_1="pp2",
     )
+
+
+def _check_gemma_rms(worker):
+    from vllm.config import set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.model_executor.layers.rms_moe import rms_keep_mask
+
+    model = worker.get_model()
+    layers = getattr(model, "language_model", model).model.layers
+    retained = []
+    for index in {0, len(layers) - 1}:
+        layer = layers[index]
+        experts = layer.experts
+        routed = experts.routed_experts
+        pruner = experts.router.rms_pruner
+        assert pruner is not None and routed.moe_config.mask_pruned_routes
+        for m in (1, 17):
+            x = torch.randn(
+                m,
+                layer.router.hidden_size,
+                device="cuda",
+                dtype=routed.w13_weight.dtype,
+            )
+            with (
+                torch.inference_mode(),
+                set_current_vllm_config(worker.vllm_config),
+                set_forward_context(None, worker.vllm_config, num_tokens=m),
+            ):
+                logits = layer.router(x)
+                native_w, native_ids = layer.router.routing_function(
+                    x, logits, pruner.top_k, True
+                )
+                keep = rms_keep_mask(
+                    native_ids,
+                    native_w.abs(),
+                    pruner.scale,
+                    pruner.eligible,
+                    pruner.edges,
+                    pruner.budget,
+                    pruner.weight_floor,
+                )
+                weights, ids = experts.router.select_experts(x, logits)
+                torch.testing.assert_close(ids, native_ids.masked_fill(~keep, -1))
+                torch.testing.assert_close(
+                    weights, native_w.masked_fill(~keep, 0), atol=0, rtol=0
+                )
+                assert keep.any(-1).all()
+                if pruner.budget:
+                    assert (~keep).any()
+                slots = torch.zeros(
+                    m, pruner.top_k, x.shape[-1], device=x.device, dtype=x.dtype
+                )
+                for expert in ids[keep].unique().tolist():
+                    rows, cols = torch.where(ids == expert)
+                    gate, up = (x[rows] @ routed.w13_weight[expert].T).chunk(2, dim=-1)
+                    hidden = torch.nn.functional.gelu(gate, approximate="tanh") * up
+                    output = hidden @ routed.w2_weight[expert].T
+                    slots[rows, cols] = (output * weights[rows, cols, None]).to(x.dtype)
+                reference = slots.sum(1)
+                actual = experts(x, logits)
+                torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
+                retained.append(keep.sum(-1).float().mean().item())
+    return retained
+
+
+@pytest.mark.core_model
+@pytest.mark.parametrize("budget", [0.0, 0.5])
+def test_gemma4_prunes_native_routes(vllm_runner, tmp_path, monkeypatch, budget):
+    """Load a small Gemma checkpoint and compare routed GELU experts to PyTorch."""
+    from safetensors.torch import save_file
+    from transformers import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4ForCausalLM as HFGemma4ForCausalLM,
+    )
+
+    from vllm import SamplingParams
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        pytest.skip("RMS Triton execution requires CUDA")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    config = Gemma4TextConfig(
+        vocab_size=512,
+        hidden_size=256,
+        hidden_size_per_layer_input=0,
+        intermediate_size=512,
+        moe_intermediate_size=128,
+        num_hidden_layers=2,
+        layer_types=["sliding_attention", "full_attention"],
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_global_key_value_heads=1,
+        head_dim=64,
+        global_head_dim=128,
+        num_experts=8,
+        top_k_experts=2,
+        enable_moe_block=True,
+        sliding_window=64,
+        max_position_embeddings=512,
+        num_kv_shared_layers=0,
+    )
+    torch.manual_seed(7)
+    model = HFGemma4ForCausalLM(config)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.router.per_expert_scale.copy_(torch.linspace(0.75, 1.75, 8))
+    model.save_pretrained(tmp_path / "model")
+    path = tmp_path / "rms.safetensors"
+    scales = torch.linspace(0.5, 2, 32).reshape(2, 8, 2, 1)
+    save_file(
+        {
+            "scale": scales,
+            "eligible": torch.ones_like(scales, dtype=torch.bool),
+            "edges": torch.empty(2, 2, 0),
+        },
+        path,
+        metadata={"format": "rms-moe-v1", "weight_floor": "null"},
+    )
+    with vllm_runner(
+        str(tmp_path / "model"),
+        skip_tokenizer_init=True,
+        dtype="bfloat16",
+        max_model_len=64,
+        max_num_seqs=2,
+        gpu_memory_utilization=0.08,
+        kv_cache_memory_bytes=32 * 1024**2,
+        enforce_eager=True,
+        kernel_config={"moe_backend": "triton"},
+        hf_overrides={"rms_expert_pruning": {"tables": str(path), "budget": budget}},
+    ) as runner:
+        assert runner.llm.collective_rpc(_check_gemma_rms)
+        output = runner.llm.generate(
+            {"prompt_token_ids": [2, 3, 4]},
+            SamplingParams(
+                temperature=0, max_tokens=3, ignore_eos=True, detokenize=False
+            ),
+        )
+        assert len(output[0].outputs[0].token_ids) == 3

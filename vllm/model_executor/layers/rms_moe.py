@@ -115,13 +115,8 @@ def rms_keep_mask(
     return ~torch.zeros_like(drop).scatter(-1, order, drop)
 
 
-class RMSMoERouter(nn.Module):
-    """Native top-k softmax followed by calibrated RMS route pruning.
-
-    Dropped slots have expert ID -1 and weight zero. Consumers must exclude
-    them from both expert dispatch and the final reduction. The fixed top-k
-    shape supports CUDA graph replay while the active assignments vary.
-    """
+class RMSLayerTable(nn.Module):
+    """Device buffers for one calibrated MoE layer."""
 
     def __init__(
         self,
@@ -144,6 +139,41 @@ class RMSMoERouter(nn.Module):
                 getattr(tables, name)[layer].to(device).contiguous(),
                 persistent=False,
             )
+
+
+class RMSRoutePruner(RMSLayerTable):
+    """Prune native slots using final gate magnitudes; preserve signed weights."""
+
+    def forward(
+        self, weights: torch.Tensor, ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.model_executor.layers.fused_moe.router.rms_pruning import (
+            prune_rms_routes,
+        )
+
+        if self.budget == 0:
+            return weights, ids
+        if weights.shape != ids.shape or ids.shape[-1] != self.top_k:
+            raise ValueError("Native router slots do not match the RMS table")
+        return prune_rms_routes(
+            ids.contiguous(),
+            weights.contiguous(),
+            self.scale,
+            self.eligible,
+            self.edges,
+            self.budget,
+            self.weight_floor,
+            native_routes=True,
+        )
+
+
+class RMSMoERouter(RMSLayerTable):
+    """Native top-k softmax followed by calibrated RMS route pruning.
+
+    Dropped slots have expert ID -1 and weight zero. Consumers must exclude
+    them from both expert dispatch and the final reduction. The fixed top-k
+    shape supports CUDA graph replay while the active assignments vary.
+    """
 
     def forward(
         self,

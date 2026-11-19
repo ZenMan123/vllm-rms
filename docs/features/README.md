@@ -2,7 +2,7 @@
 
 ## MoE inference
 
-- [RMS expert pruning for Granite](rms_expert_pruning.md)
+- [RMS expert pruning for routed MoE models](rms_expert_pruning.md)
 
 ## KV Cache Offloading
 

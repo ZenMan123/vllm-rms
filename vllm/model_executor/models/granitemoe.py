@@ -26,13 +26,11 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from transformers.configuration_utils import PreTrainedConfig
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -60,7 +58,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .granite import granite_layer_attn_params
@@ -72,9 +69,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.rms_moe import RMSMoETables
 
 
 class GraniteMoeMoE(nn.Module):
@@ -96,8 +90,6 @@ class GraniteMoeMoE(nn.Module):
         tp_size: int | None = None,
         is_sequence_parallel=False,
         prefix: str = "",
-        rms_tables: "RMSMoETables | None" = None,
-        rms_budget: float = 0.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -111,17 +103,6 @@ class GraniteMoeMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        routing = None
-        if rms_tables is not None:
-            from vllm.model_executor.layers.rms_moe import RMSMoERouter
-
-            routing = RMSMoERouter(
-                rms_tables,
-                extract_layer_index(prefix),
-                rms_budget,
-                self.gate.weight.device,
-            )
-
         self.experts = FusedMoEFactory(
             num_experts=num_experts,
             top_k=top_k,
@@ -133,8 +114,7 @@ class GraniteMoeMoE(nn.Module):
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
             is_sequence_parallel=self.is_sequence_parallel,
-            custom_routing_function=routing,
-            mask_pruned_routes=rms_tables is not None,
+            rms_fused_topk=True,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -263,8 +243,6 @@ class GraniteMoeDecoderLayer(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
-        rms_tables: "RMSMoETables | None" = None,
-        rms_budget: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -293,8 +271,6 @@ class GraniteMoeDecoderLayer(nn.Module):
             quant_config=quant_config,
             is_sequence_parallel=parallel_config.use_sequence_parallel_moe,
             prefix=f"{prefix}.block_sparse_moe",
-            rms_tables=rms_tables,
-            rms_budget=rms_budget,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -355,47 +331,6 @@ class GraniteMoeModel(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
 
-        rms_tables = None
-        rms_budget = 0.0
-        rms_config = getattr(config, "rms_expert_pruning", None)
-        if rms_config is not None:
-            from vllm.model_executor.layers.fused_moe.expert_substitution import (
-                get_expert_substitution_spec,
-            )
-            from vllm.model_executor.layers.rms_moe import (
-                RMSMoETables,
-                validate_rms_budget,
-            )
-
-            if not isinstance(rms_config, dict) or set(rms_config) != {
-                "tables",
-                "budget",
-            }:
-                raise ValueError("rms_expert_pruning requires tables and budget")
-            parallel = vllm_config.parallel_config
-            if (
-                not current_platform.is_cuda()
-                or quant_config is not None
-                or vllm_config.lora_config is not None
-                or parallel.enable_expert_parallel
-                or parallel.enable_eplb
-                or envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
-                or get_expert_substitution_spec(vllm_config.model_config) is not None
-            ):
-                raise ValueError(
-                    "RMS expert pruning requires CUDA, a pruning-capable MoE backend, "
-                    "unquantized weights, and routing without EP, EPLB, LoRA "
-                    "or routing simulation or expert substitution"
-                )
-            rms_budget = validate_rms_budget(rms_config["budget"])
-            rms_tables = RMSMoETables.load(rms_config["tables"])
-            if rms_tables.scale.shape[:3] != (
-                config.num_hidden_layers,
-                config.num_local_experts,
-                config.num_experts_per_tok,
-            ):
-                raise ValueError("RMS table dimensions do not match the Granite model")
-
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
@@ -407,8 +342,6 @@ class GraniteMoeModel(nn.Module, EagleModelMixin):
             lambda prefix: GraniteMoeDecoderLayer(
                 vllm_config,
                 prefix=prefix,
-                rms_tables=rms_tables,
-                rms_budget=rms_budget,
             ),
             prefix=f"{prefix}.layers",
         )

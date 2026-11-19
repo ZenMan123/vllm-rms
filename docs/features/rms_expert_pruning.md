@@ -1,12 +1,12 @@
-# RMS expert pruning for Granite MoE
+# RMS expert pruning for routed MoE models
 
 RMS expert pruning uses a calibrated table to omit low-score expert assignments
-before the expert matrix multiplications. It is opt-in through the Granite HF
-configuration field `rms_expert_pruning`. Without this field, Granite uses its
-standard router.
+before the expert matrix multiplications. It is opt-in through the HF
+configuration field `rms_expert_pruning`. Models using the decomposed FusedMoE execution path can prune the final
+assignments returned by their native router.
 
-The implementation supports `GraniteMoeForCausalLM` on CUDA with unquantized
-weights. Backend selection uses the normal vLLM oracle, restricted to kernels
+The implementation uses unquantized experts on CUDA. Granite retains its fused
+top-k implementation. Gemma 4 MoE uses its native router followed by RMS. Backend selection uses the normal vLLM oracle, restricted to kernels
 that declare support for pruning individual expert assignments. You can omit
 `--moe-backend` to use `auto`, or select Triton explicitly:
 
@@ -76,6 +76,24 @@ vllm serve ibm-granite/granite-3.1-3b-a800m-instruct \
   --hf-overrides '{"rms_expert_pruning":{"tables":"/data/relative4.safetensors","budget":0.09856785088777542}}'
 ```
 
+A Gemma 4 MoE checkpoint takes the same option with its own calibration:
+
+```bash
+vllm serve google/gemma-4-26B-A4B-it --language-model-only \
+  --dtype bfloat16 --moe-backend triton \
+  --hf-overrides '{"rms_expert_pruning":{"tables":"/data/gemma4-rms.safetensors","budget":0.1}}'
+```
+
+For this checkpoint the scale shape is `[30, 128, 8, bins]`. In the generic
+path, rank is the slot emitted by the native router. Collect calibration from
+that same slot order and use the magnitude of the **final** routing weight for
+binning and scoring. Gemma folds its learned per-expert scale into this
+weight. The retained slots keep their original signed weights, ordering and
+precision. Pre-existing padding IDs are excluded from table lookups. A zero
+budget passes the native routing tensors through. Fused shared/zero expert
+slots and input-weighted experts require their own integration. A shared MLP
+computed separately from routed experts is outside the pruning budget.
+
 The corresponding Python configuration is:
 
 ```python
@@ -100,7 +118,7 @@ fitting.
 
 ## Routing and dispatch
 
-The router selects the original top-k logits, computes their FP32 softmax, and
+The Granite router selects the original top-k logits, computes their FP32 softmax, and
 rounds the gates to the hidden-state dtype before looking up the table. This
 matches the research Granite router's BF16 gate convention. The interval index
 counts boundaries strictly below the rounded gate. At rank r for expert e,
@@ -114,7 +132,7 @@ one expert. Finite protected scores participate in the denominator. A zero
 budget or zero score sum retains every original assignment. The remaining
 gates keep their original values.
 
-On CUDA, contiguous rows with at most 64 experts and top-k at most 32 fuse
+On Granite CUDA, contiguous rows with at most 64 experts and top-k at most 32 fuse
 selection, native rank restoration, softmax and pruning in one Triton launch.
 The selection preserves CUDA radix top-k's input order, including signed zero,
 and the final small-sort tie behavior required by rank-indexed calibration.
@@ -153,7 +171,7 @@ requires `supports_pruned_routes()` only when this flag is true.
 Without `rms_expert_pruning`, Granite does not load
 the RMS module or tables and uses its original router and expert execution.
 
-Budget zero still enables the RMS router and its calibrated gate rounding. To
+On Granite, budget zero still enables the RMS router and its calibrated gate rounding. To
 disable the feature completely, omit `rms_expert_pruning`; budget zero is not a
 promise of bitwise equality with the standard vLLM router.
 

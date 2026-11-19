@@ -108,6 +108,22 @@ def test_triton_sum_ignores_pruned_nan_slots_without_expert_parallelism():
     torch.testing.assert_close(output, expected.expand_as(output), atol=0, rtol=0)
 
 
+def test_gemma_gelu_nan_slots_cannot_contaminate_kept_experts():
+    config = replace(make_dummy_moe_config(), mask_pruned_routes=True)
+    experts = TritonExperts(config, FUSED_MOE_UNQUANTIZED_CONFIG)
+    ids = torch.tensor([[3, -1], [-1, 5]], device=DEVICE_TYPE, dtype=torch.int32)
+    values = torch.randn(4, 256, device=DEVICE_TYPE, dtype=torch.bfloat16)
+    valid = ids.flatten() >= 0
+    values[~valid] = float("nan")
+    out = values.new_empty(4, 128)
+    experts.activation(MoEActivation.GELU_TANH, out, values, topk_ids=ids)
+    result = values.new_empty(2, 128)
+    experts.moe_sum(out.view(2, 2, 128), result, ids)
+    gate, up = values[valid].chunk(2, dim=-1)
+    expected = torch.nn.functional.gelu(gate.float(), approximate="tanh") * up.float()
+    torch.testing.assert_close(result, expected.to(result.dtype), atol=2e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_rows", [8, 72, 1032])
 def test_triton_pruned_activation_leaves_dropped_rows_unwritten(dtype, num_rows):
